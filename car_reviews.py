@@ -3,7 +3,6 @@ import nltk
 from nltk import downloader
 from nltk import pos_tag
 from nltk.corpus import stopwords
-from nltk.stem import SnowballStemmer
 from nltk.stem.wordnet import WordNetLemmatizer
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
@@ -20,7 +19,6 @@ downloader.download('averaged_perceptron_tagger_eng')
 english_stop_words = set(stopwords.words("english"))
 all_stop_words = set()
 
-stemmer = SnowballStemmer("english")
 lemmatizer = WordNetLemmatizer()
 
 # add versions of a stopword with and without apostrophes
@@ -85,7 +83,6 @@ def preprocess_stem(text: str) -> str:
     tokens = nltk.word_tokenize(text)
     token_tags = pos_tag(tokens)
 
-    # tokens = [stemmer.stem(word) for word in tokens]
     tokens = [lemmatizer.lemmatize(word, pos_to_wordnet(pos)) for word, pos in token_tags]
     return " ".join(tokens)
 
@@ -107,7 +104,7 @@ def run_ml_pipeline(input_data: pd.DataFrame) -> None:
         input_data,
         test_size=test_size,
         random_state=120,
-        stratify=input_data["Sentiment"],
+        stratify=input_data["Sentiment"],  # stratify by sentiment, so that the test set has the same distribution of sentiments as the training set
     )
 
     # ----- A note about unseen words in the test set ------:
