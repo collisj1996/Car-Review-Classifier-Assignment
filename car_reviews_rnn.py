@@ -1,15 +1,17 @@
 from dataclasses import dataclass
-from datetime import datetime
 
 import pandas as pd
 import nltk
 import torch
+import torchtext; torchtext.disable_torchtext_deprecation_warning()
+import matplotlib.pyplot as plt
 from torchtext.vocab import GloVe
 from nltk import downloader
 from nltk import pos_tag
 from nltk.corpus import stopwords
 from nltk.stem.wordnet import WordNetLemmatizer
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 
 downloader.download("stopwords")
 downloader.download("punkt_tab")
@@ -30,33 +32,49 @@ for word in english_stop_words:
 
 
 class RNNModel(torch.nn.Module):
-    """PyTorch RNN model for sentiment analysis."""
+    """PyTorch based RNN model"""
 
     def __init__(
-        self, input_size, hidden_size, layers_n, output_size, device, embedding
+        self,
+        input_size,
+        hidden_size,
+        layers_n,
+        output_size,
+        device,
+        embedding,
     ):
         super(RNNModel, self).__init__()
         self.embedding = torch.nn.Embedding.from_pretrained(embedding.vectors)
-        self.device = device  # is this necessary?
+        self.device = device
         self.layers_n = layers_n
         self.hidden_size = hidden_size
         self.lstm = torch.nn.LSTM(input_size, hidden_size, layers_n, batch_first=True)
         self.fully_connected = torch.nn.Linear(hidden_size, output_size)
 
-    def forward(self, x):
-        x = self.embedding(x)  # embedding layer
+    def forward(self, input_data, text_lengths):
+        input_data = input_data.to(self.device)
+        # text_lengths = torch.tensor(text_lengths).to(self.device)
 
-        # initial_hidden_state = torch.zeros(self.layers_n, x.size(0), self.hidden_size).to(self.device) # initial hidden state
-        # initial_cell_state = torch.zeros(self.layers_n, x.size(0), self.hidden_size).to(self.device) # initial cell state
+        emdedded_data = self.embedding(input_data)  # embedding layer
 
-        out, _ = self.lstm(x)  # LSTM output
-        last_hidden = out[:, -1, :]
+        initial_hidden_state = torch.zeros(
+            self.layers_n, emdedded_data.size(0), self.hidden_size
+        ).to(
+            self.device
+        )  # initial hidden state
+        initial_cell_state = torch.zeros(self.layers_n, emdedded_data.size(0), self.hidden_size).to(
+            self.device
+        )  # initial cell state
+
+        packed_embedded_data = torch.nn.utils.rnn.pack_padded_sequence(
+            emdedded_data, text_lengths, batch_first=True, enforce_sorted=False
+        )
+
+        rnn_out, (hidden_state, cell_state) = self.lstm(packed_embedded_data, (initial_hidden_state, initial_cell_state))  # LSTM output
+
+        last_hidden = hidden_state[-1]
         fc_out = self.fully_connected(last_hidden)
-
-        # out has shape (batch_size, seq_len, output_size)
-        # we want the last output for each sequence, so we take the last time step
-        # out = out[:, -1, :]
-        return fc_out
+        return fc_out.squeeze(1) 
 
 
 @dataclass
@@ -64,10 +82,10 @@ class Hyperparameters:
     input_size: int = 50
     hidden_size: int = 50
     layers_n: int = 1
-    output_size: int = 2
-    epochs: int = 100
+    epochs: int = 200
     learning_rate: float = 0.001
-    max_length: int = 150
+    max_length: int = 500
+    early_stop_retry_threshold: int = 10
 
 
 class CarReviewClassifier:
@@ -75,6 +93,8 @@ class CarReviewClassifier:
         self,
         training_hyperparameters: Hyperparameters = Hyperparameters(),
         all_data_path="car-reviews.csv",
+        torch_seed=None,
+        use_debug_cache=False,
     ):
         self.glove = GloVe(
             name="6B", dim=50
@@ -83,37 +103,87 @@ class CarReviewClassifier:
         self.hyperparameters = training_hyperparameters
         self.model = None
 
+        if torch_seed is not None:
+            torch.manual_seed(torch_seed)
+
         self.all_data = pd.read_csv(all_data_path)
 
-        training_data_unprocessed, validation_data_unprocessed = self._get_train_test_split()
+        if use_debug_cache:
+            # check if the preprocessed data files exist
+            try:
+                # load the preprocessed data from the debug_cache folder
+                self.training_x = torch.load("debug_cache/training_x.pt")
+                self.validation_x = torch.load("debug_cache/validation_x.pt")
+                self.training_y = torch.load("debug_cache/training_y.pt")
+                self.validation_y = torch.load("debug_cache/validation_y.pt")
+                self.train_lengths = torch.load("debug_cache/train_lengths.pt")
+                self.validation_lengths = torch.load("debug_cache/validation_lengths.pt")
 
-        training_vectors = self._pipeline_preprocess_and_vectorise(
+                if self.device.type == "cuda":
+                    self.training_x = self.training_x.cuda()
+                    self.validation_x = self.validation_x.cuda()
+                    self.training_y = self.training_y.cuda()
+                    self.validation_y = self.validation_y.cuda()
+                return
+            except Exception:
+                pass
+            
+        training_data_unprocessed, validation_data_unprocessed = (
+            self._get_train_test_split()
+        )
+
+        self.training_y = self._get_label_tensors(
+            training_data_unprocessed["Sentiment"]
+        )
+        self.validation_y = self._get_label_tensors(
+            validation_data_unprocessed["Sentiment"]
+        )
+
+        self.training_x, self.train_lengths = self._pipeline_preprocess_and_vectorise(
             training_data_unprocessed
         )
-        validation_vectors = self._pipeline_preprocess_and_vectorise(
+        self.validation_x, self.validation_lengths = self._pipeline_preprocess_and_vectorise(
             validation_data_unprocessed
         )
 
-        self.training_data = torch.utils.data.DataLoader(
-            training_vectors, batch_size=len(training_vectors), shuffle=True
-        )
-        self.validation_data = torch.utils.data.DataLoader(
-            validation_vectors, batch_size=len(validation_vectors), shuffle=True
-        )
+        if self.device.type == "cuda":
+            self.training_x = self.training_x.cuda()
+            self.validation_x = self.validation_x.cuda()
+            self.training_y = self.training_y.cuda()
+            self.validation_y = self.validation_y.cuda()
+
+        if use_debug_cache:
+            # save the preprocessed data to a file for later use
+            torch.save(self.training_x, "debug_cache/training_x.pt")
+            torch.save(self.validation_x, "debug_cache/validation_x.pt")
+            torch.save(self.training_y, "debug_cache/training_y.pt")
+            torch.save(self.validation_y, "debug_cache/validation_y.pt")
+            torch.save(self.train_lengths, "debug_cache/train_lengths.pt")
+            torch.save(self.validation_lengths, "debug_cache/validation_lengths.pt")
+
+    def _get_label_tensors(self, labels):
+        """Converts labels to tensors."""
+        label_tensors = []
+
+        for label in labels:
+            if label == "Pos":
+                label_tensors.append(torch.tensor(1.0))
+            else:
+                label_tensors.append(torch.tensor(0.0))
+
+        return torch.stack(label_tensors)
 
     def _get_train_test_split(self):
         test_size = 276  # 20% of the data for testing, using absolute number of samples
 
         # Split the data into training and validation sets
-        training_data_unprocessed, validation_data_unprocessed = (
-            train_test_split(
-                self.all_data,
-                test_size=test_size,
-                random_state=120,
-                stratify=self.all_data[
-                    "Sentiment"
-                ],  # stratify by sentiment, so that the test set has the same distribution of sentiments as the training set
-            )
+        training_data_unprocessed, validation_data_unprocessed = train_test_split(
+            self.all_data,
+            test_size=test_size,
+            random_state=120,
+            stratify=self.all_data[
+                "Sentiment"
+            ],  # stratify by sentiment, so that the test set has the same distribution of sentiments as the training set
         )
 
         return training_data_unprocessed, validation_data_unprocessed
@@ -149,46 +219,47 @@ class CarReviewClassifier:
 
         return tokens
 
-    def _create_tensor_from_tokens(self, tokens, sentiment):
+    def _create_tensor_from_tokens(self, tokens):
         """Converts tokens to a tensor using GloVe embeddings."""
 
         # Convert tokens to indices using GloVe embeddings
         indices = [
             self.glove.stoi[token] for token in tokens if token in self.glove.stoi
         ]
-        label = 1 if sentiment == "Pos" else 0
 
-        # Pad or truncate the sequence to the desired length
-        if len(indices) < self.hyperparameters.max_length:
-            indices += [0] * (
-                self.hyperparameters.max_length - len(indices)
-            )  # Pad with zeros
-        else:
-            indices = indices[: self.hyperparameters.max_length]  # Truncate
-
-        return (torch.tensor(indices), torch.tensor(label).long())
+        return torch.tensor(indices)
 
     def _pipeline_preprocess_and_vectorise(self, input_data):
         """Pipeline that pre-procesesses and vectorizes the input data."""
-        output_data = []
+        tensors = []
+        lengths = []
 
         print("Preprocessing and vectorizing data...")
 
         for index, row in input_data.iterrows():
             tokens = self._preprocess_clean_text(row["Review"])
-            tensor = self._create_tensor_from_tokens(tokens, row["Sentiment"])
-            output_data.append(tensor)
+            tensor = self._create_tensor_from_tokens(tokens)
 
-        return output_data
+            # if len(tensor) > self.hyperparameters.max_length:
+            #     tensor = tensor[: self.hyperparameters.max_length]
+
+            tensors.append(tensor)
+            lengths.append(len(tensor))
+
+        padded_tensors = torch.nn.utils.rnn.pad_sequence(
+            tensors, batch_first=True
+        )
+
+        return padded_tensors, lengths
 
     def _init_new_model(self):
         self.model = RNNModel(
-            self.hyperparameters.input_size,
-            self.hyperparameters.hidden_size,
-            self.hyperparameters.layers_n,
-            self.hyperparameters.output_size,
-            self.device,
-            self.glove,
+            input_size=self.hyperparameters.input_size,
+            hidden_size=self.hyperparameters.hidden_size,
+            layers_n=self.hyperparameters.layers_n,
+            output_size=1, # binary classification
+            device=self.device,
+            embedding=self.glove,
         )
 
     def set_training_hyperparameters(self, hyperparameters: Hyperparameters):
@@ -202,37 +273,48 @@ class CarReviewClassifier:
 
     def train(self):
         self._init_new_model()
+        self.model.to(self.device)
 
-        loss_function = torch.nn.CrossEntropyLoss()
+        loss_function = torch.nn.BCEWithLogitsLoss()
         optimization_function = torch.optim.Adam(
             self.model.parameters(), lr=self.hyperparameters.learning_rate
         )
 
-        # training_reviews, training_labels = map(list, zip(*self.training_data))
-
-        data_loader = torch.utils.data.DataLoader(
-            dataset=self.training_data, batch_size=len(self.training_data), shuffle=True
-        )
-
-        validation_loader = torch.utils.data.DataLoader(
-            dataset=self.validation_data, batch_size=len(self.validation_data), shuffle=True
-        )
+        best_model = None
+        best_val_cost = float("inf")
+        early_stop_retry_count = 0
 
         for epoch in range(self.hyperparameters.epochs):
-            # for i, (review_embeddings, labels) in enumerate(self.training_data):
-            for reviews, labels in data_loader:
+            # for train_reviews, train_sentiments in self.training_data:
 
-                optimization_function.zero_grad()
-                # Forward pass
-                outputs = self.model(reviews)
-                loss = loss_function(outputs, labels)
+            optimization_function.zero_grad()
+            # Forward pass
+            outputs = self.model(self.training_x, self.train_lengths)
+            loss = loss_function(outputs, self.training_y)
 
-                # Backward pass and optimization
-                loss.backward()
-                optimization_function.step()
+            # Backward pass and optimization
+            loss.backward()
+            optimization_function.step()
 
-            training_accuracy = self.accuracy(data_loader)
-            validation_accuracy = self.accuracy(validation_loader)
+            # for validation_reviews, validation_sentiments in self.validation_data:
+            val_loss = loss_function(
+                self.model(self.validation_x, self.validation_lengths), self.validation_y
+            )
+
+            # Use early stopping to prevent overfitting
+            if val_loss < best_val_cost:
+                early_stop_retry_count = 0
+                best_val_cost = val_loss
+                best_model = self.model.state_dict()
+                print(f"Best model saved at epoch {epoch + 1}")
+            else:
+                early_stop_retry_count += 1
+                if early_stop_retry_count >= self.hyperparameters.early_stop_retry_threshold:
+                    print("Early stopping triggered.")
+                    break
+
+            training_accuracy = self.accuracy(self.training_x, self.training_y, self.train_lengths)
+            validation_accuracy = self.accuracy(self.validation_x, self.validation_y, self.validation_lengths)
 
             print(
                 f"Epoch [{epoch + 1}/{self.hyperparameters.epochs}], "
@@ -241,25 +323,113 @@ class CarReviewClassifier:
                 f"Validation Accuracy: {validation_accuracy:.4f}"
             )
 
-    def accuracy(self, data_loader):
-        correct, total = 0, 0
-        for reviews, sentiments in data_loader:
-            output = self.model(reviews)
-            pred = output.max(1, keepdim=True)[1]
-            correct += pred.eq(sentiments.view_as(pred)).sum().item()
-            total += sentiments.shape[0]
+        # Save the best model
+        if best_model is not None:
+            self.model.load_state_dict(best_model)
+            print("Best model loaded.")
+
+    def accuracy(self, data, labels, packed_lengths):
+        """Calculates the accuracy of the model on the given data."""
+
+        total = len(data)
+        output = self.model(data, packed_lengths)
+        correct = (output > 0.5).eq(labels.view_as(output)).sum().item()
+            
+        print(f"Accuracy: {correct}/{total} = {correct / total:.4f}")
         return correct / total
+    
+    def confusion_matrix(self, data, labels, packed_lengths):
+        """Calculates and displays the confusion matrix."""
+
+        display_labels = ["Pos", "Neg"]
+
+        output = self.model(data, packed_lengths)
+        predictions = (output > 0.5).int().view_as(labels)
+
+        cm = confusion_matrix(labels.cpu(), predictions.cpu())
+        cmd = ConfusionMatrixDisplay(
+            confusion_matrix=cm, display_labels=display_labels
+        )
+        cmd.plot()
+        plt.show()
+
+
+class HyperparameterSearch:
+    def __init__(self):
+        self.crc = CarReviewClassifier()
+        self.best_hyperparameters = None
+        self.best_validation_accuracy = 0.0
+        self.history = []
+
+    def search(self):
+        # Implement hyperparameter search logic here
+        search_space = {
+            "hidden_size": [50, 100, 150],
+            "layers_n": [1],
+            "epochs": [50],
+            "learning_rate": [0.001],
+        }
+
+        self._dfsearch(search_space, 0)
+
+    def _dfsearch(self, search_space, depth, current_hyperparameters=None):
+        if current_hyperparameters is None:
+            current_hyperparameters = {}
+            for key in search_space.keys():
+                current_hyperparameters = {
+                    key: value[0] for key, value in search_space.items()
+                }
+    
+        if depth == len(search_space):
+            hyperparameters = Hyperparameters(
+                **current_hyperparameters
+            )
+            self.crc.set_training_hyperparameters(hyperparameters)
+            self.crc.train()
+            validation_accuracy = self.crc.accuracy(self.crc.validation_x, self.crc.validation_y, self.crc.validation_lengths)
+
+            history_entry = {
+                "hyperparameters": current_hyperparameters.copy(),
+                "validation_accuracy": validation_accuracy,
+            }
+
+            self.history.append(history_entry)
+
+            if validation_accuracy > self.best_validation_accuracy:
+                self.best_hyperparameters = current_hyperparameters.copy()
+                self.best_validation_accuracy = validation_accuracy
+
+            return
+
+        for key, values in search_space.items():
+            for value in values:
+                current_hyperparameters[key] = value
+                self._dfsearch(search_space, depth + 1, current_hyperparameters)
+
+
+
+def run_final_model():
+    crc = CarReviewClassifier()
+    crc.load_model("final")
+    crc.accuracy(crc.validation_x, crc.validation_y, crc.validation_lengths)
 
 
 if __name__ == "__main__":
 
-    
-    # mode 1 
-    crc = CarReviewClassifier()
+    # mode 1
+    crc = CarReviewClassifier(use_debug_cache=True, torch_seed=1)
     crc.train()
     crc.save_model("test_2")
-    
+    crc.confusion_matrix(crc.validation_x, crc.validation_y, crc.validation_lengths)
+
     # mode 2
     # crc = CarReviewClassifier()
     # crc.load_model("test")
-    # crc.accuracy()
+    # crc.accuracy(crc.validation_x, crc.validation_y, crc.validation_lengths)
+    # crc.confusion_matrix(crc.validation_x, crc.validation_y, crc.validation_lengths)
+
+    # hyperparameter search
+    # hps = HyperparameterSearch()
+    # hps.search()
+    # print("Best hyperparameters:", hps.best_hyperparameters)
+    # print("Best validation accuracy:", hps.best_validation_accuracy)

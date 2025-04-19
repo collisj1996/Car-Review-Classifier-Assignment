@@ -1,5 +1,6 @@
 import pandas as pd
 import nltk
+import matplotlib.pyplot as plt
 from nltk import downloader
 from nltk import pos_tag
 from nltk.corpus import stopwords
@@ -9,7 +10,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.naive_bayes import MultinomialNB
 from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.base import BaseEstimator, TransformerMixin
-from sklearn.metrics import accuracy_score, confusion_matrix
+from sklearn.metrics import accuracy_score, confusion_matrix, ConfusionMatrixDisplay
 
 downloader.download("stopwords")
 downloader.download("punkt_tab")
@@ -132,13 +133,17 @@ def run_ml_pipeline(input_data: pd.DataFrame) -> None:
 
     cm = confusion_matrix(test_data["Sentiment"], predictions, labels=labels)
 
-    cm_normalized = cm.astype("float") / cm.sum()
+    cmd = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=labels)
+    cmd.plot()
+    plt.show()
 
-    print("Confusion Matrix Proportions:")
-    print(f"True Negative: {cm_normalized[0][0] * 100:.2f}%")
-    print(f"False Negative: {cm_normalized[1][0] * 100:.2f}%")
-    print(f"True Positive: {cm_normalized[1][1] * 100:.2f}%")
-    print(f"False Positive: {cm_normalized[0][1] * 100:.2f}%")
+    # cm_normalized = cm.astype("float") / cm.sum()
+
+    # print("Confusion Matrix Proportions:")
+    # print(f"True Negative: {cm_normalized[0][0] * 100:.2f}%")
+    # print(f"False Negative: {cm_normalized[1][0] * 100:.2f}%")
+    # print(f"True Positive: {cm_normalized[1][1] * 100:.2f}%")
+    # print(f"False Positive: {cm_normalized[0][1] * 100:.2f}%")
 
 
 def words_and_punctuation_removal_example():
